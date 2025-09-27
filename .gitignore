@@ -1,0 +1,16 @@
+data
+data_split
+data_v2
+data_v3
+Garbage.v3i.yolov8
+multi_object_data
+results
+runs
+
+.venv
+.idea
+
+
+*.zip
+
+*.pt
