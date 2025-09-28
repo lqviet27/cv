@@ -1,7 +1,6 @@
 data
 data_split
-data_v2
-data_v3
+data_raw
 Garbage.v3i.yolov8
 multi_object_data
 results
@@ -14,3 +13,14 @@ runs
 *.zip
 
 *.pt
+
+multi_object_data_
+multi_object_data_test
+multi_object_data_val
+
+.gitignore
+
+/__pycache__/
+
+kaggle
+

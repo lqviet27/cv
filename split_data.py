@@ -63,7 +63,7 @@ random.seed(42)
 
 # Define paths
 source_directory = r"E:\Workspace\Code\Python\CV_project\Garbage.v3i.yolov8\train"
-output_directory = r"E:\Workspace\Code\Python\CV_project\data_v3"
+output_directory = r"E:\Workspace\Code\Python\CV_project\data_v4"
 
 # Split the dataset (70% train, 20% validation, 10% test)
 split_dataset(source_directory, output_directory)

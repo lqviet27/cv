@@ -3,7 +3,8 @@ import numpy as np
 import os
 import random
 import shutil
-from typing import List, Tuple, Optional
+from collections import Counter
+from typing import List, Tuple, Optional, Dict
 from pathlib import Path
 
 
@@ -126,23 +127,40 @@ class YOLODataAugmentation:
 
     def check_overlap(self, new_bbox: Tuple[int, int, int, int],
                       existing_bboxes: List[Tuple[int, int, int, int]],
-                      overlap_threshold: float = 0.3) -> bool:
-        """Kiểm tra xem bbox mới có overlap với các bbox đã có không"""
+                      overlap_threshold: float = 0.3,
+                      occlusion_threshold: float = 0.85) -> bool:
+        """Check whether the new bbox overlaps or fully occludes existing ones"""
+        if not existing_bboxes:
+            return False
+
         x1, y1, x2, y2 = new_bbox
-        new_area = (x2 - x1) * (y2 - y1)
+        new_width = max(0, x2 - x1)
+        new_height = max(0, y2 - y1)
+        new_area = new_width * new_height
+        if new_area == 0:
+            return True
 
         for ex1, ey1, ex2, ey2 in existing_bboxes:
-            # Tính intersection
+            existing_width = max(0, ex2 - ex1)
+            existing_height = max(0, ey2 - ey1)
+            existing_area = existing_width * existing_height
+            if existing_area == 0:
+                continue
+
             ix1 = max(x1, ex1)
             iy1 = max(y1, ey1)
             ix2 = min(x2, ex2)
             iy2 = min(y2, ey2)
+            if ix1 >= ix2 or iy1 >= iy2:
+                continue
 
-            if ix1 < ix2 and iy1 < iy2:
-                intersection = (ix2 - ix1) * (iy2 - iy1)
-                overlap_ratio = intersection / new_area
-                if overlap_ratio > overlap_threshold:
-                    return True
+            intersection = (ix2 - ix1) * (iy2 - iy1)
+            overlap_new = intersection / new_area
+            overlap_existing = intersection / existing_area
+
+            if overlap_new > overlap_threshold or overlap_existing > occlusion_threshold:
+                return True
+
         return False
 
     def paste_object_on_background(self, object_img: np.ndarray, background_img: np.ndarray,
@@ -225,6 +243,52 @@ class YOLODataAugmentation:
                     all_objects.append((str(image_path), class_id, (x_center, y_center, width, height)))
 
         return all_objects
+
+    def group_objects_by_class(self, all_objects: List[Tuple[str, int, Tuple[float, float, float, float]]]) -> Dict[int, List[Tuple[str, int, Tuple[float, float, float, float]]]]:
+        """Nhóm objects theo class để phục vụ cân bằng lớp"""
+        grouped: Dict[int, List[Tuple[str, int, Tuple[float, float, float, float]]]] = {}
+        for item in all_objects:
+            grouped.setdefault(item[1], []).append(item)
+        return grouped
+
+    def select_balanced_objects(
+        self,
+        class_to_objects: Dict[int, List[Tuple[str, int, Tuple[float, float, float, float]]]],
+        class_usage: Dict[int, int],
+        num_objects: int
+    ) -> List[Tuple[str, int, Tuple[float, float, float, float]]]:
+        """Chon danh sach object uu tien cac lop dang thieu"""
+        if num_objects <= 0 or not class_to_objects:
+            return []
+
+        usage_snapshot = class_usage.copy()
+        selected: List[Tuple[str, int, Tuple[float, float, float, float]]] = []
+
+        for _ in range(num_objects):
+            valid_classes = [cid for cid, objs in class_to_objects.items() if objs]
+            if not valid_classes:
+                break
+
+            min_usage = min(usage_snapshot.get(cid, 0) for cid in valid_classes)
+            candidates = [cid for cid in valid_classes if usage_snapshot.get(cid, 0) == min_usage]
+            chosen_class = random.choice(candidates)
+
+            pool = class_to_objects[chosen_class]
+            if not pool:
+                continue
+
+            chosen_object = random.choice(pool)
+            if len(pool) > 1:
+                attempts = 0
+                while chosen_object in selected and attempts < 5:
+                    chosen_object = random.choice(pool)
+                    attempts += 1
+
+            selected.append(chosen_object)
+            usage_snapshot[chosen_class] = usage_snapshot.get(chosen_class, 0) + 1
+
+        random.shuffle(selected)
+        return selected
 
     def create_multi_object_image(self, all_objects: List[Tuple[str, int, Tuple[float, float, float, float]]],
                                   output_path: str, target_size: Tuple[int, int] = (640, 640),
@@ -323,18 +387,20 @@ class YOLODataAugmentation:
     def generate_multi_object_dataset(self, input_images_dir: str, input_labels_dir: str,
                                       output_dir: str, num_images: int = 100,
                                       target_size: Tuple[int, int] = (640, 640),
-                                      max_objects: int = 8, min_objects: int = 2):
+                                      max_objects: int = 8, min_objects: int = 2,
+                                      balance_classes: bool = True):
         """
-        Tạo dataset multi-object với cấu trúc thư mục chuẩn YOLO
+        Tao dataset multi-object voi cau truc thu muc chuan YOLO
 
         Args:
-            input_images_dir: Thư mục chứa ảnh gốc
-            input_labels_dir: Thư mục chứa label
-            output_dir: Thư mục output chính
-            num_images: Số lượng ảnh multi-object cần tạo (có thể tạo bao nhiêu cũng được)
-            target_size: Kích thước ảnh đích
-            max_objects: Số object tối đa trong một ảnh
-            min_objects: Số object tối thiểu trong một ảnh
+            input_images_dir: Thu muc chua anh goc
+            input_labels_dir: Thu muc chua label
+            output_dir: Thu muc output chinh
+            num_images: So luong anh multi-object can tao
+            target_size: Kich thuoc anh dich
+            max_objects: So object toi da trong mot anh
+            min_objects: So object toi thieu trong mot anh
+            balance_classes: True thi uu tien chon object de can bang cac lop
         """
         print("Đang thu thập tất cả objects...")
         all_objects = self.collect_all_objects(input_images_dir, input_labels_dir)
@@ -358,18 +424,54 @@ class YOLODataAugmentation:
 
         print(f"Bắt đầu tạo {num_images} ảnh multi-object...")
 
+        class_to_objects: Dict[int, List[Tuple[str, int, Tuple[float, float, float, float]]]] = {}
+        class_usage: Optional[Dict[int, int]] = None
+        if balance_classes:
+            class_to_objects = self.group_objects_by_class(all_objects)
+            class_usage = {class_id: 0 for class_id in class_to_objects}
+
         while success_count < num_images and attempt_count < max_attempts:
-            # Tạo tên file
             filename = f"multi_object_{success_count:04d}"
             image_path = images_dir / f"{filename}.jpg"
             label_path = labels_dir / f"{filename}.txt"
 
-            if self.create_multi_object_image_v2(all_objects, str(image_path), str(label_path),
-                                                 target_size, max_objects, min_objects):
-                success_count += 1
-                print(f"✓ Đã tạo: {filename} ({success_count}/{num_images})")
+            desired_objects = random.randint(min_objects, min(max_objects, len(all_objects)))
+            selected_objects: Optional[List[Tuple[str, int, Tuple[float, float, float, float]]]] = None
+
+            if balance_classes and class_usage is not None and class_to_objects:
+                selected_objects = self.select_balanced_objects(
+                    class_to_objects, class_usage, desired_objects
+                )
+                if len(selected_objects) < min_objects:
+                    success = False
+                else:
+                    success = self.create_multi_object_image_v2(
+                        all_objects,
+                        str(image_path),
+                        str(label_path),
+                        target_size,
+                        max_objects,
+                        min_objects,
+                        num_objects=len(selected_objects),
+                        selected_objects=selected_objects,
+                        class_usage=class_usage
+                    )
             else:
-                print(f"✗ Thất bại lần thử {attempt_count + 1}")
+                success = self.create_multi_object_image_v2(
+                    all_objects,
+                    str(image_path),
+                    str(label_path),
+                    target_size,
+                    max_objects,
+                    min_objects,
+                    num_objects=desired_objects
+                )
+
+            if success:
+                success_count += 1
+                print(f"? ? t?o: {filename} ({success_count}/{num_images})")
+            else:
+                print(f"? Th?t b?i l?n th? {attempt_count + 1}")
 
             attempt_count += 1
 
@@ -380,104 +482,103 @@ class YOLODataAugmentation:
         print(f"  - Labels: {labels_dir}")
         print(f"{'=' * 50}")
 
-    def create_multi_object_image_v2(self, all_objects: List[Tuple[str, int, Tuple[float, float, float, float]]],
-                                     image_output_path: str, label_output_path: str,
-                                     target_size: Tuple[int, int] = (640, 640),
-                                     max_objects: int = 8, min_objects: int = 2) -> bool:
-        """
-        Tạo một ảnh multi-object với đường dẫn riêng biệt cho image và label
-
-        Args:
-            all_objects: Danh sách tất cả objects có sẵn
-            image_output_path: Đường dẫn lưu ảnh
-            label_output_path: Đường dẫn lưu label
-            target_size: Kích thước ảnh đích
-            max_objects: Số object tối đa trong một ảnh
-            min_objects: Số object tối thiểu trong một ảnh
-
-        Returns:
-            True nếu tạo thành công
-        """
+    def create_multi_object_image_v2(
+        self,
+        all_objects: List[Tuple[str, int, Tuple[float, float, float, float]]],
+        image_output_path: str,
+        label_output_path: str,
+        target_size: Tuple[int, int] = (640, 640),
+        max_objects: int = 8,
+        min_objects: int = 2,
+        num_objects: Optional[int] = None,
+        selected_objects: Optional[List[Tuple[str, int, Tuple[float, float, float, float]]]] = None,
+        class_usage: Optional[Dict[int, int]] = None
+    ) -> bool:
+        """Tao mot anh multi-object voi duong dan rieng biet cho image va label"""
         if len(all_objects) < min_objects:
             return False
 
-        # Tạo hoặc chọn ảnh nền
+        # Tao hoac chon anh nen
         if self.background_images:
             background_path = random.choice(self.background_images)
             background = cv2.imread(background_path)
             if background is None:
                 background = np.ones((target_size[1], target_size[0], 3), dtype=np.uint8) * 128
         else:
-            # Tạo nền trơn màu ngẫu nhiên
+            # Tao nen tren mau ngu nhien
             color = (random.randint(50, 200), random.randint(50, 200), random.randint(50, 200))
             background = np.full((target_size[1], target_size[0], 3), color, dtype=np.uint8)
 
         background = cv2.resize(background, target_size)
         result_image = background.copy()
 
-        # Chọn ngẫu nhiên số lượng objects
-        num_objects = random.randint(min_objects, min(max_objects, len(all_objects)))
-        selected_objects = random.sample(all_objects, num_objects)
+        max_selectable = min(max_objects, len(all_objects))
+        if selected_objects is not None:
+            selected_objects = list(selected_objects[:max_selectable])
+            if len(selected_objects) < min_objects:
+                return False
+        else:
+            if max_selectable < min_objects:
+                return False
+            if num_objects is None:
+                num_objects = random.randint(min_objects, max_selectable)
+            else:
+                num_objects = max(min_objects, min(num_objects, max_selectable))
+            selected_objects = random.sample(all_objects, num_objects)
 
-        new_labels = []
-        existing_bboxes = []
+        new_labels: List[Tuple[int, float, float, float, float]] = []
+        existing_bboxes: List[Tuple[int, int, int, int]] = []
+        local_usage: Counter = Counter()
 
         for image_path, class_id, yolo_coords in selected_objects:
             try:
-                # Đọc ảnh gốc
                 source_image = cv2.imread(image_path)
                 if source_image is None:
                     continue
 
                 img_h, img_w = source_image.shape[:2]
-
-                # Chuyển đổi sang pixel coordinates
                 bbox = self.yolo_to_bbox(yolo_coords, img_w, img_h)
-
-                # Cắt object
                 object_img = self.extract_object(source_image, bbox)
 
                 if object_img.size == 0:
                     continue
 
-                # Apply augmentation cho object
                 object_img = self.apply_augmentation(object_img)
-
-                # Dán object lên nền
                 result_image, new_bbox = self.paste_object_on_background(
                     object_img, result_image, existing_bboxes
                 )
 
                 if new_bbox is not None:
                     existing_bboxes.append(new_bbox)
-
-                    # Chuyển đổi về YOLO format
                     yolo_coords_new = self.bbox_to_yolo(new_bbox, target_size[0], target_size[1])
                     new_labels.append((class_id, *yolo_coords_new))
+                    local_usage[class_id] += 1
 
             except Exception as e:
-                print(f"Lỗi khi xử lý object từ {image_path}: {e}")
+                print(f"Loi khi xu ly object tu {image_path}: {e}")
                 continue
 
         if len(new_labels) < min_objects:
             return False
 
-        # Lưu ảnh
         cv2.imwrite(image_output_path, result_image)
 
-        # Lưu label
         with open(label_output_path, 'w') as f:
             for class_id, x_center, y_center, width, height in new_labels:
                 f.write(f"{class_id} {x_center:.6f} {y_center:.6f} {width:.6f} {height:.6f}\n")
+
+        if class_usage is not None:
+            for class_id, count in local_usage.items():
+                class_usage[class_id] = class_usage.get(class_id, 0) + count
 
         return True
 
 # Sử dụng
 if __name__ == "__main__":
     # Thiết lập đường dẫn
-    input_images_dir = "data/train/images"
-    input_labels_dir = "data/train/labels"
-    output_dir = "multi_object_data"
+    input_images_dir = "data/test/images"
+    input_labels_dir = "data/test/labels"
+    output_dir = "multi_object_data_test"
     background_dir = "backgrounds"  # Tùy chọn
 
     # Khởi tạo với hoặc không có background
@@ -498,7 +599,7 @@ if __name__ == "__main__":
         input_images_dir=input_images_dir,
         input_labels_dir=input_labels_dir,
         output_dir=output_dir,
-        num_images=2000,  # Có thể tăng lên 1000, 2000... tùy ý
+        num_images=424,  # Có thể tăng lên 1000, 2000... tùy ý
         target_size=(640, 640),
         max_objects=6,
         min_objects=2
