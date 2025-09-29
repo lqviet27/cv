@@ -9,15 +9,26 @@ from pathlib import Path
 
 
 class YOLODataAugmentation:
-    def __init__(self, background_dir: Optional[str] = None):
+    def __init__(self,
+                 background_dir: Optional[str] = None,
+                 min_object_area: float = 0.04,
+                 max_object_area: float = 0.3):
         """
-        Khởi tạo class để tạo ảnh multi-object từ nhiều ảnh nguồn
+        Initialize helper for building synthetic multi-object images.
 
         Args:
-            background_dir: Đường dẫn đến thư mục chứa ảnh nền (tùy chọn)
+            background_dir: Optional directory containing background images.
+            min_object_area: Minimum fraction of background area an object should occupy.
+            max_object_area: Maximum fraction of background area an object should occupy.
         """
+        if not (0 < min_object_area <= max_object_area <= 1.0):
+            raise ValueError("Object area ratios must satisfy 0 < min <= max <= 1")
+
         self.background_dir = Path(background_dir) if background_dir else None
         self.background_images = self._load_background_images() if self.background_dir else []
+        self.min_object_area = min_object_area
+        self.max_object_area = max_object_area
+
 
     def _load_background_images(self) -> List[str]:
         """Tải danh sách đường dẫn ảnh nền"""
@@ -127,8 +138,8 @@ class YOLODataAugmentation:
 
     def check_overlap(self, new_bbox: Tuple[int, int, int, int],
                       existing_bboxes: List[Tuple[int, int, int, int]],
-                      overlap_threshold: float = 0.3,
-                      occlusion_threshold: float = 0.85) -> bool:
+                      overlap_threshold: float = 0.2,
+                      occlusion_threshold: float = 0.7) -> bool:
         """Check whether the new bbox overlaps or fully occludes existing ones"""
         if not existing_bboxes:
             return False
@@ -167,52 +178,69 @@ class YOLODataAugmentation:
                                    existing_bboxes: List[Tuple[int, int, int, int]] = None,
                                    max_attempts: int = 50) -> Tuple[np.ndarray, Optional[Tuple[int, int, int, int]]]:
         """
-        Dán object lên nền mới với kiểm tra overlap
+        Paste an object onto a background with random scaling and overlap checks.
 
         Args:
-            object_img: Ảnh object
-            background_img: Ảnh nền
-            existing_bboxes: Danh sách các bbox đã có
-            max_attempts: Số lần thử tối đa để tìm vị trí không overlap
+            object_img: Cropped object image.
+            background_img: Target background image.
+            existing_bboxes: Bounding boxes already placed on the background.
+            max_attempts: Maximum trials to find a valid placement.
 
         Returns:
-            Tuple (ảnh kết quả, bounding box mới hoặc None nếu không tìm được vị trí)
+            Tuple of (augmented background, new bounding box) or (background, None) if placement fails.
         """
         if existing_bboxes is None:
             existing_bboxes = []
 
-        obj_h, obj_w = object_img.shape[:2]
         bg_h, bg_w = background_img.shape[:2]
+        bg_area = bg_w * bg_h
 
-        # Thử tìm vị trí không overlap
-        for attempt in range(max_attempts):
-            max_x = max(0, bg_w - obj_w)
-            max_y = max(0, bg_h - obj_h)
+        base_h, base_w = object_img.shape[:2]
+        base_area = max(1, base_w * base_h)
 
+        for _ in range(max_attempts):
+            target_ratio = random.uniform(self.min_object_area, self.max_object_area)
+            scale = (target_ratio * bg_area / base_area) ** 0.5
+
+            new_w = max(1, int(base_w * scale))
+            new_h = max(1, int(base_h * scale))
+
+            if new_w >= bg_w or new_h >= bg_h:
+                scale_limit = min((bg_w - 2) / base_w, (bg_h - 2) / base_h)
+                if scale_limit <= 0:
+                    continue
+                scale = scale_limit * random.uniform(0.6, 0.9)
+                new_w = max(1, int(base_w * scale))
+                new_h = max(1, int(base_h * scale))
+
+            if new_w < 2 or new_h < 2:
+                continue
+
+            max_x = bg_w - new_w
+            max_y = bg_h - new_h
             if max_x <= 0 or max_y <= 0:
-                return background_img, None
+                continue
 
             x = random.randint(0, max_x)
             y = random.randint(0, max_y)
+            new_bbox = (x, y, x + new_w, y + new_h)
 
-            new_bbox = (x, y, x + obj_w, y + obj_h)
+            if self.check_overlap(new_bbox, existing_bboxes):
+                continue
 
-            # Kiểm tra overlap
-            if not self.check_overlap(new_bbox, existing_bboxes):
-                # Tạo mask cho object
-                mask = self.create_mask(object_img)
-                mask_3ch = cv2.merge([mask, mask, mask])
+            interpolation = cv2.INTER_AREA if scale < 1 else cv2.INTER_LINEAR
+            resized_object = cv2.resize(object_img, (new_w, new_h), interpolation=interpolation)
+            mask = self.create_mask(resized_object)
+            mask_3ch = cv2.merge([mask, mask, mask])
 
-                # Tạo bản sao của nền
-                result = background_img.copy()
+            result = background_img.copy()
+            roi = result[y:y + new_h, x:x + new_w]
+            result[y:y + new_h, x:x + new_w] = np.where(mask_3ch > 0, resized_object, roi)
 
-                # Dán object lên nền
-                roi = result[y:y + obj_h, x:x + obj_w]
-                result[y:y + obj_h, x:x + obj_w] = np.where(mask_3ch > 0, object_img, roi)
-
-                return result, new_bbox
+            return result, new_bbox
 
         return background_img, None
+
 
     def collect_all_objects(self, input_images_dir: str, input_labels_dir: str) -> List[
         Tuple[str, int, Tuple[float, float, float, float]]]:
@@ -576,31 +604,19 @@ class YOLODataAugmentation:
 # Sử dụng
 if __name__ == "__main__":
     # Thiết lập đường dẫn
-    input_images_dir = "data/test/images"
-    input_labels_dir = "data/test/labels"
+    input_images_dir = "data_raw/test/images"
+    input_labels_dir = "data_raw/test/labels"
     output_dir = "multi_object_data_test"
-    background_dir = "backgrounds"  # Tùy chọn
+    background_dir = "backgrounds_640"  # Tùy chọn
 
-    # Khởi tạo với hoặc không có background
-    # augmenter = YOLODataAugmentation(background_dir)  # Hoặc None
-    augmenter = YOLODataAugmentation()
-    # Tạo dataset multi-object
-    # augmenter.generate_multi_object_dataset(
-    #     input_images_dir=input_images_dir,
-    #     input_labels_dir=input_labels_dir,
-    #     output_dir=output_dir,
-    #     num_images=100,
-    #     target_size=(640, 640),
-    #     max_objects=6,
-    #     min_objects=2
-    # )
+    augmenter = YOLODataAugmentation(background_dir)
 
     augmenter.generate_multi_object_dataset(
         input_images_dir=input_images_dir,
         input_labels_dir=input_labels_dir,
         output_dir=output_dir,
-        num_images=424,  # Có thể tăng lên 1000, 2000... tùy ý
+        num_images=400,  # Có thể tăng lên 1000, 2000... tùy ý
         target_size=(640, 640),
-        max_objects=6,
-        min_objects=2
+        max_objects=9,
+        min_objects=3
     )
